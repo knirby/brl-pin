@@ -3,19 +3,24 @@
 brl-pin - Simple tool to pin commands to specific strata in Bedrock Linux
 
 Usage:
-  brl-pin <command> <stratum>              # pin command (assumes /usr/bin/<command>)
-  brl-pin <command> <stratum> <path>       # pin with explicit path
+    brl-pin <command>                        # pin the provider selected by Bedrock
   brl-pin --list                           # show current pins
   brl-pin --rm <command>                   # remove a pin
+    brl-pin --install                        # install in a user bin directory on PATH
+    brl-pin --update                         # update from GitHub
+    brl-pin --uninstall                      # remove the local installation
 """
 
 import sys
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 CONF = Path("/bedrock/etc/bedrock.conf")
+REPOSITORY = "https://github.com/knirby/brl-pin.git"
 
 def die(msg: str, code: int = 1):
     print(f"error: {msg}", file=sys.stderr)
@@ -44,6 +49,103 @@ def apply_config():
         die("`brl apply` failed. Check the output above.")
     except FileNotFoundError:
         die("`brl` command not found. Is Bedrock installed correctly?")
+
+def run_lookup(args):
+    try:
+        result = subprocess.run(args, check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        die(f"`{args[0]}` command not found.")
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout).strip()
+        die(detail or f"`{' '.join(args)}` failed.")
+
+    output = result.stdout.strip()
+    if not output or "\n" in output:
+        die(f"`{' '.join(args)}` returned an unexpected result: {output!r}")
+    return output
+
+def resolve_command(cmd: str):
+    provider = run_lookup(["brl", "which", "--bin", cmd])
+
+    if provider == "global":
+        path = run_lookup(["which", cmd])
+    else:
+        path = run_lookup(["brl", "strat", "--restrict", provider, "which", cmd])
+
+    if not Path(path).is_absolute():
+        die(f"Resolved command path is not absolute: {path}")
+
+    actual_provider = run_lookup(["brl", "which", "--file", path])
+    if actual_provider != provider:
+        die(f"Resolved {cmd} to {path} in {actual_provider}, expected {provider}.")
+
+    return provider, path
+
+def installation_path():
+    home = Path.home().resolve()
+    user_bins = {(home / ".local" / "bin").resolve(), (home / "bin").resolve()}
+
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        directory = Path(entry or ".").expanduser().resolve()
+        if directory not in user_bins:
+            continue
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if directory.is_dir() and os.access(directory, os.W_OK):
+            return directory / "brl-pin"
+
+    die("No writable ~/bin or ~/.local/bin directory is already on PATH.")
+
+def current_installation_path():
+    running_file = Path(__file__).resolve()
+    home = Path.home().resolve()
+    user_bins = {home / ".local" / "bin", home / "bin"}
+    if running_file.name == "brl-pin" and running_file.parent in user_bins:
+        return running_file
+    return installation_path()
+
+def install_file(source: Path, destination: Path):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=destination.parent, prefix=".brl-pin-")
+    os.close(descriptor)
+    try:
+        shutil.copyfile(source, temporary)
+        os.chmod(temporary, 0o755)
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+def install_tool():
+    destination = installation_path()
+    install_file(Path(__file__).resolve(), destination)
+    print(f"Installed brl-pin to {destination}")
+
+def update_tool():
+    destination = current_installation_path()
+    try:
+        with tempfile.TemporaryDirectory(prefix="brl-pin-update-") as temporary:
+            checkout = Path(temporary) / "repo"
+            subprocess.run(["git", "clone", "--depth", "1", REPOSITORY, str(checkout)], check=True)
+            source = checkout / "brl-pin"
+            if not source.is_file():
+                die("Repository does not contain brl-pin.")
+            install_file(source, destination)
+    except FileNotFoundError:
+        die("`git` is required to update brl-pin.")
+    except subprocess.CalledProcessError:
+        die("Update failed. Check the git output above.")
+    print("Updated brl-pin from GitHub.")
+
+def uninstall_tool():
+    destination = current_installation_path()
+    try:
+        destination.unlink()
+    except FileNotFoundError:
+        pass
+    print("Removed the local brl-pin installation.")
 
 def usage():
     print(__doc__.strip())
@@ -95,6 +197,16 @@ def main():
 
     args = sys.argv[1:]
 
+    if args[0] in {"--install", "--update", "--uninstall"}:
+        if len(args) != 1:
+            usage()
+        {
+            "--install": install_tool,
+            "--update": update_tool,
+            "--uninstall": uninstall_tool,
+        }[args[0]]()
+        return
+
     # --list does not need root
     if args[0] == "--list":
         content = read_conf()
@@ -115,19 +227,14 @@ def main():
         apply_config()
         return
 
-    # Normal pin
-    if len(args) == 2:
-        cmd, stratum = args
-        path = f"/usr/bin/{cmd}"
-    elif len(args) == 3:
-        cmd, stratum, path = args
-    else:
+    if len(args) != 1:
         usage()
 
-    # Basic sanity
-    if not cmd or not stratum:
-        die("command and stratum must be non-empty")
+    cmd = args[0]
+    if not cmd:
+        die("command must be non-empty")
 
+    stratum, path = resolve_command(cmd)
     new_content = add_pin(content, cmd, stratum, path)
     write_conf(new_content)
     print(f"Pinned {cmd} → {stratum}:{path}")
