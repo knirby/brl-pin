@@ -9,11 +9,14 @@ brl-pin --list
 sudo brl-pin <command> <stratum>
 sudo brl-pin --rm <command>
 sudo brl-pin --desktop <command>
+sudo brl-pin --desktop-rm <command>
 ```
 
 For example, `sudo brl-pin code fedora` makes `code` resolve from `fedora` by default. `brl-pin` asks Bedrock to resolve the command inside the requested stratum, then writes that stratum and path to `cross-bin`. Licensed under GPL-3.0-only; see [LICENSE](LICENSE).
 
-`sudo brl-pin --desktop code` updates desktop launchers whose `Exec` command is `code` to run the executable from its current pin. If no matching launcher exists, it creates one in the invoking user's `~/.local/share/applications` directory. The command does not create or change the pin itself.
+`sudo brl-pin --desktop code` refreshes the launcher's name, icon, arguments, and executable from the `code` pin's stratum. It writes a user-local override and leaves package-owned desktop files untouched. If no matching launcher exists, it creates one with a generic application icon. Run the command again after changing the pin or updating the app package.
+
+`sudo brl-pin --desktop-rm code` removes brl-pin-managed launchers from the invoking user's `~/.local/share/applications` directory. It does not remove package-owned desktop entries.
 
 ## Install
 
