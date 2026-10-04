@@ -2,15 +2,18 @@
 
 `brl-pin` makes a command run from the stratum you choose when you call it normally in your shell.
 
-Requires Bedrock Linux and Python 3. Listing pins does not need root. Adding or removing a pin updates `/bedrock/etc/bedrock.conf` and runs `brl apply`, so those commands must be run as root.
+Requires Bedrock Linux and Python 3. Listing pins does not need root. Adding or removing a pin updates `/bedrock/etc/bedrock.conf` and runs `brl apply`, so those commands must be run as root. Desktop entry synchronization also requires root.
 
 ```sh
 brl-pin --list
 sudo brl-pin <command> <stratum>
 sudo brl-pin --rm <command>
+sudo brl-pin --desktop <command>
 ```
 
 For example, `sudo brl-pin code fedora` makes `code` resolve from `fedora` by default. `brl-pin` asks Bedrock to resolve the command inside the requested stratum, then writes that stratum and path to `cross-bin`. Licensed under GPL-3.0-only; see [LICENSE](LICENSE).
+
+`sudo brl-pin --desktop code` updates desktop launchers whose `Exec` command is `code` to run the executable from its current pin. If no matching launcher exists, it creates one in the invoking user's `~/.local/share/applications` directory. The command does not create or change the pin itself.
 
 ## Install
 

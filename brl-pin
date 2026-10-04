@@ -6,6 +6,7 @@ Usage:
     brl-pin <command> <stratum>             # pin the command from this stratum
     brl-pin --list                          # show current pins
     brl-pin --rm <command>                  # remove a pin
+    brl-pin --desktop <command>             # sync its desktop launcher with its pin
     brl-pin --install                       # install brl-pin
     brl-pin --update                        # update from GitHub
     brl-pin --uninstall                     # remove the installation
@@ -15,6 +16,7 @@ import sys
 import os
 import pwd
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -205,6 +207,146 @@ def add_pin(content: str, cmd: str, stratum: str, path: str) -> str:
 
     return "\n".join(final) + "\n"
 
+def find_pin(content: str, cmd: str):
+    pattern = re.compile(rf"^\s*pin/bin/{re.escape(cmd)}\s*=\s*(.+)$")
+    found = None
+    for line in content.splitlines():
+        match = pattern.match(line)
+        if match:
+            found = match.group(1).strip()
+    if found is None or ":" not in found:
+        die(f"No valid pin found for '{cmd}'. Pin it first with brl-pin {cmd} <stratum>.")
+    stratum, path = found.split(":", 1)
+    if not stratum or not path:
+        die(f"No valid pin found for '{cmd}'.")
+    return stratum, path
+
+def desktop_home():
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            return pwd.getpwnam(sudo_user)
+        except KeyError:
+            die(f"Could not find home directory for user '{sudo_user}'.")
+    return pwd.getpwuid(os.getuid())
+
+def desktop_application_dirs(home: Path):
+    directories = [
+        home / ".local/share/applications",
+        Path("/usr/local/share/applications"),
+        Path("/usr/share/applications"),
+    ]
+    strata_dir = Path("/bedrock/strata")
+    if strata_dir.is_dir():
+        directories.extend(stratum / "usr/share/applications" for stratum in strata_dir.iterdir())
+
+    unique = []
+    seen = set()
+    for directory in directories:
+        resolved = directory.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(directory)
+    return unique
+
+def desktop_exec(line: str):
+    key, separator, value = line.partition("=")
+    if not separator or key.strip() != "Exec":
+        return None
+    try:
+        arguments = shlex.split(value, posix=True)
+    except ValueError:
+        return None
+    return arguments[0] if arguments else None
+
+def desktop_quote(value: str):
+    if re.fullmatch(r"[A-Za-z0-9_./:+-]+", value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("`", "\\`").replace("$", "\\$").replace("%", "%%")
+    return f'"{escaped}"'
+
+def rewrite_desktop_exec(line: str, stratum: str, path: str):
+    key, separator, value = line.partition("=")
+    if not separator:
+        return line
+    match = re.match(r'^(\s*)(?:"((?:\\.|[^"])*)"|(\S+))(.*)$', value)
+    if not match:
+        die(f"Cannot parse desktop Exec line: {line}")
+    executable = " ".join(desktop_quote(part) for part in ("strat", stratum, path))
+    return f"{key}{separator}{match.group(1)}{executable}{match.group(4)}"
+
+def sync_desktop_entry(content: str, cmd: str, stratum: str, path: str):
+    lines = content.splitlines()
+    in_desktop_entry = False
+    exec_index = None
+    exec_command = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_desktop_entry = stripped == "[Desktop Entry]"
+        elif in_desktop_entry and stripped.startswith("Exec="):
+            exec_index = index
+            exec_command = desktop_exec(stripped)
+            break
+
+    if exec_index is not None and exec_command and Path(exec_command).name == cmd:
+        lines[exec_index] = rewrite_desktop_exec(lines[exec_index], stratum, path)
+        return "\n".join(lines) + "\n"
+    return None
+
+def sync_desktop(cmd: str, content: str):
+    if not cmd or Path(cmd).name != cmd:
+        die("desktop command must be an executable name, not a path")
+    stratum, path = find_pin(content, cmd)
+    user = desktop_home()
+    home = Path(user.pw_dir)
+    matches = []
+    for directory in desktop_application_dirs(home):
+        if not directory.is_dir():
+            continue
+        for entry in directory.rglob("*.desktop"):
+            try:
+                original = entry.read_text()
+            except (OSError, UnicodeError):
+                continue
+            updated = sync_desktop_entry(original, cmd, stratum, path)
+            if updated is not None:
+                matches.append((entry, updated))
+
+    if matches:
+        for entry, updated in matches:
+            try:
+                entry.write_text(updated)
+            except OSError as error:
+                die(f"Failed to update desktop entry {entry}: {error}")
+        print(f"Updated {len(matches)} desktop entr{'y' if len(matches) == 1 else 'ies'} for '{cmd}'.")
+        return
+
+    directory = home / ".local/share/applications"
+    try:
+        missing = []
+        parent = directory
+        while not parent.exists():
+            missing.append(parent)
+            parent = parent.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        for created in missing:
+            os.chown(created, user.pw_uid, user.pw_gid)
+        entry = directory / f"{cmd}.desktop"
+        entry.write_text(
+            "[Desktop Entry]\n"
+            f"Name={cmd}\n"
+            f"Exec={desktop_quote('strat')} {desktop_quote(stratum)} {desktop_quote(path)}\n"
+            "Type=Application\n"
+            "Terminal=false\n"
+            "Categories=Utility;\n"
+        )
+        os.chown(entry, user.pw_uid, user.pw_gid)
+    except OSError as error:
+        die(f"Failed to create desktop entry for '{cmd}': {error}")
+    print(f"Created desktop entry {entry} for '{cmd}'.")
+
 def main():
     if len(sys.argv) < 2:
         usage()
@@ -239,6 +381,12 @@ def main():
         write_conf(new_content)
         print(f"Removed pin for '{cmd}'")
         apply_config()
+        return
+
+    if args[0] == "--desktop":
+        if len(args) != 2:
+            usage()
+        sync_desktop(args[1], content)
         return
 
     if len(args) != 2:
