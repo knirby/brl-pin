@@ -3,7 +3,7 @@
 brl-pin - Simple tool to pin commands to specific strata in Bedrock Linux
 
 Usage:
-    brl-pin <command>                       # pin the provider selected by Bedrock
+    brl-pin <command> <stratum>             # pin the command from this stratum
     brl-pin --list                          # show current pins
     brl-pin --rm <command>                  # remove a pin
     brl-pin --install                       # install brl-pin
@@ -46,6 +46,9 @@ def write_conf(content: str):
 def apply_config():
     try:
         subprocess.run(["brl", "apply"], check=True)
+    except KeyboardInterrupt:
+        print("\nInterrupted while applying Bedrock configuration.", file=sys.stderr)
+        raise SystemExit(130)
     except subprocess.CalledProcessError:
         die("`brl apply` failed. Check the output above.")
     except FileNotFoundError:
@@ -65,22 +68,12 @@ def run_lookup(args):
         die(f"`{' '.join(args)}` returned an unexpected result: {output!r}")
     return output
 
-def resolve_command(cmd: str):
-    provider = run_lookup(["brl", "which", "--bin", cmd])
-
-    if provider == "global":
-        path = run_lookup(["which", cmd])
-    else:
-        path = run_lookup(["brl", "strat", "--restrict", provider, "which", cmd])
-
+def resolve_command(cmd: str, stratum: str):
+    path = run_lookup(["brl", "strat", "--restrict", stratum, "which", cmd])
     if not Path(path).is_absolute():
         die(f"Resolved command path is not absolute: {path}")
 
-    actual_provider = run_lookup(["brl", "which", "--file", path])
-    if actual_provider != provider:
-        die(f"Resolved {cmd} to {path} in {actual_provider}, expected {provider}.")
-
-    return provider, path
+    return path
 
 def installation_path():
     home = Path.home().resolve()
@@ -248,14 +241,14 @@ def main():
         apply_config()
         return
 
-    if len(args) != 1:
+    if len(args) != 2:
         usage()
 
-    cmd = args[0]
-    if not cmd:
-        die("command must be non-empty")
+    cmd, stratum = args
+    if not cmd or not stratum:
+        die("command and stratum must be non-empty")
 
-    stratum, path = resolve_command(cmd)
+    path = resolve_command(cmd, stratum)
     new_content = add_pin(content, cmd, stratum, path)
     write_conf(new_content)
     print(f"Pinned {cmd} → {stratum}:{path}")
