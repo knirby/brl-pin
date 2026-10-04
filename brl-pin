@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""
+brl-pin - Simple tool to pin commands to specific strata in Bedrock Linux
+
+Usage:
+  brl-pin <command> <stratum>              # pin command (assumes /usr/bin/<command>)
+  brl-pin <command> <stratum> <path>       # pin with explicit path
+  brl-pin --list                           # show current pins
+  brl-pin --rm <command>                   # remove a pin
+"""
+
+import sys
+import os
+import re
+import subprocess
+from pathlib import Path
+
+CONF = Path("/bedrock/etc/bedrock.conf")
+
+def die(msg: str, code: int = 1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def require_root():
+    if os.geteuid() != 0:
+        die("This operation requires root. Re-run with sudo.")
+
+def read_conf() -> str:
+    try:
+        return CONF.read_text()
+    except Exception as e:
+        die(f"Failed to read {CONF}: {e}")
+
+def write_conf(content: str):
+    try:
+        CONF.write_text(content)
+    except Exception as e:
+        die(f"Failed to write {CONF}: {e}")
+
+def apply_config():
+    try:
+        subprocess.run(["brl", "apply"], check=True)
+    except subprocess.CalledProcessError:
+        die("`brl apply` failed. Check the output above.")
+    except FileNotFoundError:
+        die("`brl` command not found. Is Bedrock installed correctly?")
+
+def usage():
+    print(__doc__.strip())
+    sys.exit(1)
+
+def list_pins(content: str):
+    print("Current pins in [cross-bin]:")
+    found = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("pin/bin/"):
+            print(f"  {stripped}")
+            found = True
+    if not found:
+        print("  (none)")
+
+def remove_pin(content: str, cmd: str) -> str:
+    pattern = re.compile(rf"^\s*pin/bin/{re.escape(cmd)}\s*=")
+    new_lines = [line for line in content.splitlines() if not pattern.match(line)]
+    return "\n".join(new_lines) + "\n"
+
+def add_pin(content: str, cmd: str, stratum: str, path: str) -> str:
+    pin_line = f"pin/bin/{cmd} = {stratum}:{path}"
+
+    # First remove any existing pin for this command
+    content = remove_pin(content, cmd)
+
+    lines = content.splitlines()
+    final = []
+    inserted = False
+
+    for line in lines:
+        final.append(line)
+        if line.strip() == "[cross-bin]" and not inserted:
+            final.append(pin_line)
+            inserted = True
+
+    if not inserted:
+        # Section didn't exist – create it
+        final.append("")
+        final.append("[cross-bin]")
+        final.append(pin_line)
+
+    return "\n".join(final) + "\n"
+
+def main():
+    if len(sys.argv) < 2:
+        usage()
+
+    args = sys.argv[1:]
+
+    # --list does not need root
+    if args[0] == "--list":
+        content = read_conf()
+        list_pins(content)
+        return
+
+    # Everything else needs root
+    require_root()
+    content = read_conf()
+
+    if args[0] == "--rm":
+        if len(args) != 2:
+            usage()
+        cmd = args[1]
+        new_content = remove_pin(content, cmd)
+        write_conf(new_content)
+        print(f"Removed pin for '{cmd}'")
+        apply_config()
+        return
+
+    # Normal pin
+    if len(args) == 2:
+        cmd, stratum = args
+        path = f"/usr/bin/{cmd}"
+    elif len(args) == 3:
+        cmd, stratum, path = args
+    else:
+        usage()
+
+    # Basic sanity
+    if not cmd or not stratum:
+        die("command and stratum must be non-empty")
+
+    new_content = add_pin(content, cmd, stratum, path)
+    write_conf(new_content)
+    print(f"Pinned {cmd} → {stratum}:{path}")
+    apply_config()
+    print("Applied successfully.")
+
+if __name__ == "__main__":
+    main()
