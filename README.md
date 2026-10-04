@@ -14,24 +14,22 @@ Pinning asks `brl which` for the provider, resolves the executable with Bedrock,
 
 ## Install
 
-Run this block of commands to:
-
-Clone the repository in `/tmp`, then install the command in `~/.local/bin`:
+Clone the repository once, then install it in `/usr/local/bin`:
 
 ```sh
 cd /tmp
 git clone https://github.com/knirby/brl-pin.git
 cd brl-pin
-python3 brl-pin --install
+sudo python3 brl-pin --install
 ```
 
-Install copies only `brl-pin` into a writable `~/.local/bin` or `~/bin` directory that is already on `PATH`. If neither directory is on `PATH`, add one yourself and rerun the install command.
+If you already cloned the repository, just run `sudo python3 brl-pin --install` from that directory. Install copies only the executable to `/usr/local/bin`; it does not edit shell configuration. Without `sudo`, install works only when `~/bin` or `~/.local/bin` already exists on `PATH` and is writable.
 
 ## Update or remove
 
 ```sh
-brl-pin --update
-brl-pin --uninstall
+sudo brl-pin --update
+sudo brl-pin --uninstall
 ```
 
-Update fetches the latest version from GitHub and replaces the installed command. Uninstall removes only the installed command.
+Update fetches the latest version from GitHub and replaces the installed executable. Uninstall removes only that executable.

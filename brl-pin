@@ -3,16 +3,17 @@
 brl-pin - Simple tool to pin commands to specific strata in Bedrock Linux
 
 Usage:
-    brl-pin <command>                        # pin the provider selected by Bedrock
-  brl-pin --list                           # show current pins
-  brl-pin --rm <command>                   # remove a pin
-    brl-pin --install                        # install in a user bin directory on PATH
-    brl-pin --update                         # update from GitHub
-    brl-pin --uninstall                      # remove the local installation
+    brl-pin <command>                       # pin the provider selected by Bedrock
+    brl-pin --list                          # show current pins
+    brl-pin --rm <command>                  # remove a pin
+    brl-pin --install                       # install brl-pin
+    brl-pin --update                        # update from GitHub
+    brl-pin --uninstall                     # remove the installation
 """
 
 import sys
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -83,40 +84,59 @@ def resolve_command(cmd: str):
 
 def installation_path():
     home = Path.home().resolve()
+    if os.geteuid() == 0:
+        system_bin = Path("/usr/local/bin")
+        if str(system_bin) in os.environ.get("PATH", "").split(os.pathsep):
+            if system_bin.is_dir() and os.access(system_bin, os.W_OK):
+                return system_bin / "brl-pin"
+        die("Cannot install: /usr/local/bin must exist, be writable, and be on PATH.")
+
     user_bins = {(home / ".local" / "bin").resolve(), (home / "bin").resolve()}
 
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         directory = Path(entry or ".").expanduser().resolve()
         if directory not in user_bins:
             continue
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            continue
         if directory.is_dir() and os.access(directory, os.W_OK):
             return directory / "brl-pin"
 
-    die("No writable ~/bin or ~/.local/bin directory is already on PATH.")
+    die("No writable ~/bin or ~/.local/bin directory is on PATH. Re-run with sudo to install in /usr/local/bin.")
 
 def current_installation_path():
     running_file = Path(__file__).resolve()
-    home = Path.home().resolve()
-    user_bins = {home / ".local" / "bin", home / "bin"}
-    if running_file.name == "brl-pin" and running_file.parent in user_bins:
-        return running_file
+    homes = {Path.home().resolve()}
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            homes.add(Path(pwd.getpwnam(sudo_user).pw_dir).resolve())
+        except KeyError:
+            pass
+    user_bins = {
+        directory.resolve()
+        for home in homes
+        for directory in (home / ".local" / "bin", home / "bin")
+    }
+    if running_file.name == "brl-pin":
+        parent = running_file.parent
+        if parent == Path("/usr/local/bin") or parent in user_bins:
+            return running_file
+        if parent.name == "bin" and parent.parent.name == ".local":
+            return running_file
     return installation_path()
 
 def install_file(source: Path, destination: Path):
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(dir=destination.parent, prefix=".brl-pin-")
-    os.close(descriptor)
     try:
-        shutil.copyfile(source, temporary)
-        os.chmod(temporary, 0o755)
-        os.replace(temporary, destination)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        descriptor, temporary = tempfile.mkstemp(dir=destination.parent, prefix=".brl-pin-")
+        os.close(descriptor)
+        try:
+            shutil.copyfile(source, temporary)
+            os.chmod(temporary, 0o755)
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    except PermissionError:
+        die(f"Permission denied writing {destination}. Re-run with sudo to install or update it.")
 
 def install_tool():
     destination = installation_path()
@@ -145,6 +165,8 @@ def uninstall_tool():
         destination.unlink()
     except FileNotFoundError:
         pass
+    except PermissionError:
+        die(f"Permission denied removing {destination}. Re-run with sudo to uninstall it.")
     print("Removed the local brl-pin installation.")
 
 def usage():
