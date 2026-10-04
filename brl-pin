@@ -86,10 +86,9 @@ def installation_path():
     home = Path.home().resolve()
     if os.geteuid() == 0:
         system_bin = Path("/usr/local/bin")
-        if str(system_bin) in os.environ.get("PATH", "").split(os.pathsep):
-            if system_bin.is_dir() and os.access(system_bin, os.W_OK):
-                return system_bin / "brl-pin"
-        die("Cannot install: /usr/local/bin must exist, be writable, and be on PATH.")
+        if system_bin.is_dir() and os.access(system_bin, os.W_OK):
+            return system_bin / "brl-pin"
+        die("Cannot install: /usr/local/bin must exist and be writable.")
 
     user_bins = {(home / ".local" / "bin").resolve(), (home / "bin").resolve()}
 
