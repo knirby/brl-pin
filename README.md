@@ -18,14 +18,16 @@ Run this block to clone the repository if needed and install or overwrite `brl-p
 
 ```sh
 cd /tmp
-if [ ! -d brl-pin/.git ]; then
+if [ -d brl-pin/.git ]; then
+	git -C brl-pin pull --ff-only
+else
 	git clone https://github.com/knirby/brl-pin.git
 fi
 cd /tmp/brl-pin
-sudo python3 brl-pin --install
+sudo install -D -m 755 brl-pin /usr/local/bin/brl-pin
 ```
 
-Install replaces an existing executable and copies only `brl-pin`; it does not edit shell configuration. Without `sudo`, install works only when `~/bin` or `~/.local/bin` already exists on `PATH` and is writable.
+This is safe to rerun: it updates an existing clone and overwrites the installed executable. It only copies `brl-pin` and does not edit shell configuration.
 
 ## Update or remove
 
