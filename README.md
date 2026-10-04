@@ -1,6 +1,6 @@
 # brl-pin
 
-`brl-pin` pins a command to the provider Bedrock currently selects for it.
+`brl-pin` pins a direct shell command to be ran from a specific Bedrock Linux Strata by default.
 
 Requires Bedrock Linux and Python 3. Listing pins does not need root. Adding or removing a pin updates `/bedrock/etc/bedrock.conf` and runs `brl apply`, so those commands must be run as root.
 
