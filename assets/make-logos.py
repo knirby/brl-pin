@@ -70,12 +70,21 @@ def segments(lines):
             col += 1
 
 
-def circles(lines):
-    """Yield the dots drawn as "( )", as (cx, cy, r) in cell units."""
+def dots(lines):
+    """Yield the dot of the "i" as cubic curves (start, control, control, end).
+
+    In the art the dot is "( )" under an underscore. Each bracket bows outward
+    from an end of that underscore and a base closes them half a unit above
+    the cell's floor, so the dot reads as one round shape apart from the stem.
+    """
     for row, line in enumerate(lines):
+        top, floor = row * 2, row * 2 + 1.5
         start = line.find("( )")
         while start != -1:
-            yield start + 1.5, row * 2 + 1, 1.15
+            left, right = start + 1, start + 2
+            yield (left, top), (left - 0.6, top), (left - 0.6, floor), (left, floor)
+            yield (right, top), (right + 0.6, top), (right + 0.6, floor), (right, floor)
+            yield (left, floor), (left, floor), (right, floor), (right, floor)
             start = line.find("( )", start + 1)
 
 
@@ -84,9 +93,9 @@ def bounds(lines):
     for (x1, y1), (x2, y2) in segments(lines):
         xs += [x1, x2]
         ys += [y1, y2]
-    for cx, cy, r in circles(lines):
-        xs += [cx - r, cx + r]
-        ys += [cy - r, cy + r]
+    for curve in dots(lines):
+        xs += [x for x, _ in curve]
+        ys += [y for _, y in curve]
     return min(xs), min(ys), max(xs), max(ys)
 
 
@@ -95,18 +104,13 @@ def art_paths(lines, ink, stroke, dx=0.0, dy=0.0, scale=1.0):
     def point(x, y):
         return f"{dx + x * CELL_W * scale:.2f} {dy + y * (CELL_H / 2) * scale:.2f}"
 
-    data = " ".join(f"M{point(*a)} L{point(*b)}" for a, b in segments(lines))
-    elements = [
-        f'<path d="{data}" fill="none" stroke="{ink}" stroke-width="{stroke * scale:.2f}" '
-        'stroke-linecap="round" stroke-linejoin="round"/>'
-    ]
-    for cx, cy, r in circles(lines):
-        x, y = point(cx, cy).split()
-        elements.append(
-            f'<circle cx="{x}" cy="{y}" r="{r * CELL_W * scale:.2f}" fill="none" '
-            f'stroke="{ink}" stroke-width="{stroke * scale:.2f}"/>'
-        )
-    return "\n  ".join(elements)
+    data = [f"M{point(*a)} L{point(*b)}" for a, b in segments(lines)]
+    data += [f"M{point(*a)} C{point(*b)} {point(*c)} {point(*d)}"
+             for a, b, c, d in dots(lines)]
+    return (
+        f'<path d="{" ".join(data)}" fill="none" stroke="{ink}" '
+        f'stroke-width="{stroke * scale:.2f}" stroke-linecap="round" stroke-linejoin="round"/>'
+    )
 
 
 def svg(width, height, body, title):

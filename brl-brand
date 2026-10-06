@@ -19,7 +19,8 @@ runs the session:
                  PRETTY_NAME and LOGO for their About pages.
   logos          bedrock-logo, -text and -text-dark in the hicolor theme under
                  /usr/local, the names freedesktop About pages look up from
-                 LOGO, plus PNG copies in /usr/local/share/pixmaps.
+                 LOGO, plus PNG copies in /usr/local/share/pixmaps sized
+                 for display managers, which draw a logo at its pixel size.
   boot splash    a Plymouth theme showing the Bedrock logo, built on the
                  distro's spinner theme, then every initramfs rebuilt through
                  kernel-install and checked before it is kept.
@@ -57,6 +58,7 @@ OS_RELEASE = Path("/etc/os-release")
 VENDOR_OS_RELEASE = Path("/usr/lib/os-release")
 ICONS = Path("/usr/local/share/icons/hicolor/scalable/apps")
 PIXMAPS = Path("/usr/local/share/pixmaps")
+TEXT_PNG_WIDTH = 240  # about 48 px tall, the height distros ship greeter logos at
 THEMES = Path("/usr/share/plymouth/themes")
 THEME = THEMES / "bedrock"
 BASE_THEME = THEMES / "spinner"
@@ -236,8 +238,8 @@ def install_logos():
     for name in ("bedrock-logo.svg", "bedrock-logo-text.svg", "bedrock-logo-text-dark.svg"):
         write_atomic(ICONS / name, asset(name).read_bytes())
     render(asset("bedrock-logo.svg"), PIXMAPS / "bedrock-logo.png", 256)
-    render(asset("bedrock-logo-text.svg"), PIXMAPS / "bedrock-logo-text.png", 1200)
-    render(asset("bedrock-logo-text-dark.svg"), PIXMAPS / "bedrock-logo-text-dark.png", 1200)
+    render(asset("bedrock-logo-text.svg"), PIXMAPS / "bedrock-logo-text.png", TEXT_PNG_WIDTH)
+    render(asset("bedrock-logo-text-dark.svg"), PIXMAPS / "bedrock-logo-text-dark.png", TEXT_PNG_WIDTH)
     log(f"logos: {ICONS} and {PIXMAPS}")
 
 

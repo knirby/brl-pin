@@ -61,7 +61,7 @@ brl-brand status
 A hijack keeps the original distro's identity. `brl-brand` rebrands the init stratum, which boots the machine and runs the session:
 
 - **os-release** takes Bedrock's name, version, logo and URLs, so About pages and boot messages say Bedrock Linux. `ID` and `VERSION_ID` keep the distro's values, which its package manager, dracut and kernel-install key on.
-- **Logos** go into the hicolor theme under `/usr/local` as `bedrock-logo`, `-text` and `-text-dark`, the names freedesktop About pages derive from `LOGO`, with PNG copies in `/usr/local/share/pixmaps`.
+- **Logos** go into the hicolor theme under `/usr/local` as `bedrock-logo`, `-text` and `-text-dark`, the names freedesktop About pages derive from `LOGO`, with PNG copies in `/usr/local/share/pixmaps`. The wordmark PNGs are 240 px wide, the size of the distro's own greeter logos, because display managers draw a logo at its pixel size; point yours at `bedrock-logo-text-dark.png` for a dark login screen.
 - **The boot splash** becomes a Plymouth theme with the logo, built on the distro's spinner theme. Every initramfs is rebuilt through `kernel-install` and kept only if it still holds systemd and the theme; otherwise the previous one is restored.
 - **Boot menu entries** are retitled by that rebuild, and the firmware entry for systemd-boot is relabelled "Bedrock Linux".
 
