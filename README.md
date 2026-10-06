@@ -62,10 +62,11 @@ A hijack keeps the original distro's identity. `brl-brand` rebrands the init str
 
 - **os-release** takes Bedrock's name, version, logo and URLs, so About pages and boot messages say Bedrock Linux. `ID` and `VERSION_ID` keep the distro's values, which its package manager, dracut and kernel-install key on.
 - **Logos** go into the hicolor theme under `/usr/local` as `bedrock-logo`, `-text` and `-text-dark`, the names freedesktop About pages derive from `LOGO`, with PNG copies in `/usr/local/share/pixmaps`. The wordmark PNGs are 240 px wide, the size of the distro's own greeter logos, because display managers draw a logo at its pixel size; point yours at `bedrock-logo-text-dark.png` for a dark login screen.
+- **The About page logo** follows `LOGO` in most desktops, but some distros build GNOME Settings with their own logo files compiled in (Fedora's `-Ddistributor_logo`), which wins over os-release. `brl-brand` finds those paths in the `gnome-control-center` binary and replaces the files with the wordmark at the same pixel size, keeping the originals in `/var/lib/brl-brand` for `revert`.
 - **The boot splash** becomes a Plymouth theme with the logo, built on the distro's spinner theme. Every initramfs is rebuilt through `kernel-install` and kept only if it still holds systemd and the theme; otherwise the previous one is restored.
 - **Boot menu entries** are retitled by that rebuild, and the firmware entry for systemd-boot is relabelled "Bedrock Linux".
 
-A path unit reruns `brl-brand refresh` when a package update replaces the distro's os-release or `brl update` changes Bedrock's version. `sudo brl-brand revert` restores the distro's branding.
+A path unit reruns `brl-brand refresh` when a package update replaces the distro's os-release or its logo files, or `brl update` changes Bedrock's version. `refresh` also re-brands the About page logo, so after updating brl-tools `sudo brl-brand refresh` is enough. `sudo brl-brand revert` restores the distro's branding.
 
 The logos in `assets/` are drawn by `assets/make-logos.py`. Bedrock's logo is ASCII art and no vector version is published, so the script draws each character as a stroke: the wordmark from the installer banner, the full form from [paradigm's gist](https://gist.github.com/paradigm/3319799), and the square mark from the favicon.
 

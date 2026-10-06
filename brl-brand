@@ -21,6 +21,10 @@ runs the session:
                  /usr/local, the names freedesktop About pages look up from
                  LOGO, plus PNG copies in /usr/local/share/pixmaps sized
                  for display managers, which draw a logo at its pixel size.
+  About page     some distros build GNOME Settings with their logo files
+                 compiled in (Fedora: -Ddistributor_logo), which wins over
+                 LOGO. Those files are replaced by the wordmark at the same
+                 pixel size; the originals are kept for revert.
   boot splash    a Plymouth theme showing the Bedrock logo, built on the
                  distro's spinner theme, then every initramfs rebuilt through
                  kernel-install and checked before it is kept.
@@ -29,7 +33,7 @@ runs the session:
                  relabelled "Bedrock Linux".
 
 A path unit reruns `refresh` when a package update replaces the distro's
-os-release or `brl update` changes Bedrock's release.
+os-release or its logo files, or `brl update` changes Bedrock's release.
 
 The logos are drawn by assets/make-logos.py from Bedrock's ASCII logo.
 """
@@ -63,6 +67,9 @@ THEMES = Path("/usr/share/plymouth/themes")
 THEME = THEMES / "bedrock"
 BASE_THEME = THEMES / "spinner"
 STATE = Path("/var/lib/brl-brand")
+LOGO_BACKUPS = STATE / "distributor-logos"
+SETTINGS_BINARY = "gnome-control-center"
+COMPILED_LOGO = re.compile(rb"/usr/share/(?:pixmaps|icons)/[A-Za-z0-9_./+-]*logo[A-Za-z0-9_./+-]*\.png")
 EFI_LABEL = NAME
 EFI_LOADER = r"\EFI\systemd\systemd-bootx64.efi"
 
@@ -84,19 +91,27 @@ ExecStart=/usr/local/bin/brl-brand refresh
 [Install]
 WantedBy=multi-user.target
 """,
-    "/etc/systemd/system/brl-brand.path": f"""\
+}
+PATH_UNIT = Path("/etc/systemd/system/brl-brand.path")
+
+
+def path_unit():
+    watched = [VENDOR_OS_RELEASE, Path("/bedrock/etc/bedrock-release")]
+    binary = shutil.which(SETTINGS_BINARY)
+    if binary:
+        watched.append(Path(binary))
+    watched += [path for path, _ in distributor_logos()]
+    lines = "".join(f"PathChanged={path}\n" for path in watched)
+    return f"""\
 [Unit]
-Description=Rebrand os-release when an update replaces it
+Description=Rebrand os-release and logos when an update replaces them
 
 [Path]
-PathChanged={VENDOR_OS_RELEASE}
-PathChanged=/bedrock/etc/bedrock-release
-Unit=brl-brand.service
+{lines}Unit=brl-brand.service
 
 [Install]
 WantedBy=multi-user.target
-""",
-}
+"""
 
 
 def die(message, code=1):
@@ -243,6 +258,73 @@ def install_logos():
     log(f"logos: {ICONS} and {PIXMAPS}")
 
 
+def png_width(path):
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(24)
+    except OSError:
+        return None
+    if header[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    return int.from_bytes(header[16:20], "big")
+
+
+def distributor_logos():
+    """[(path, dark)] for the logo files compiled into GNOME Settings.
+
+    Distros that build it with -Ddistributor_logo (Fedora, RHEL) show those
+    files on the About page whatever os-release says. A file named "white"
+    is the dark-mode variant.
+    """
+    binary = shutil.which(SETTINGS_BINARY)
+    if not binary:
+        return []
+    try:
+        data = Path(binary).read_bytes()
+    except OSError:
+        return []
+    paths = sorted({Path(match.decode()) for match in COMPILED_LOGO.findall(data)})
+    return [(path, "white" in path.name.lower()) for path in paths]
+
+
+def logo_backup(path):
+    return LOGO_BACKUPS / str(path).lstrip("/").replace("/", "__")
+
+
+def brand_distributor_logos():
+    """Replace the compiled-in logos; returns how many changed."""
+    changed = 0
+    for path, dark in distributor_logos():
+        width = png_width(path) or png_width(logo_backup(path)) or TEXT_PNG_WIDTH
+        svg = asset("bedrock-logo-text-dark.svg" if dark else "bedrock-logo-text.svg")
+        with tempfile.TemporaryDirectory() as directory:
+            ours = Path(directory) / "logo.png"
+            render(svg, ours, width)
+            content = ours.read_bytes()
+        try:
+            current = path.read_bytes()
+        except OSError:
+            current = None
+        if current == content:
+            continue
+        if current is not None:
+            # The distro's file, new or updated: keep it for revert.
+            write_atomic(logo_backup(path), current)
+        write_atomic(path, content)
+        changed += 1
+        log(f"About page: {path} now shows the Bedrock wordmark")
+    return changed
+
+
+def restore_distributor_logos():
+    for path, _ in distributor_logos():
+        backup = logo_backup(path)
+        if backup.is_file():
+            write_atomic(path, backup.read_bytes())
+            backup.unlink()
+    shutil.rmtree(LOGO_BACKUPS, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Boot splash
 
@@ -372,6 +454,7 @@ def relabel_efi_entry():
 def install_units():
     for path, unit in UNITS.items():
         write_atomic(Path(path), unit)
+    write_atomic(PATH_UNIT, path_unit())
     run("systemctl", "daemon-reload")
     run("systemctl", "enable", "brl-brand.service", "brl-brand.path", check=False)
     run("systemctl", "start", "brl-brand.path", check=False)
@@ -382,6 +465,7 @@ def apply():
     if refresh_release():
         log(f"os-release: {OS_RELEASE} now names {NAME}")
     install_logos()
+    brand_distributor_logos()
     install_theme()
     rebuild_initrds()
     relabel_efi_entry()
@@ -393,6 +477,13 @@ def refresh():
     require_root()
     if refresh_release():
         log(f"os-release: refreshed {OS_RELEASE}")
+    if (ICONS / "bedrock-logo.svg").is_file():
+        brand_distributor_logos()
+        # Settings updates can move its compiled-in logo paths; keep watching the right ones.
+        if PATH_UNIT.is_file() and PATH_UNIT.read_text() != path_unit():
+            write_atomic(PATH_UNIT, path_unit())
+            run("systemctl", "daemon-reload", check=False)
+            run("systemctl", "restart", "brl-brand.path", check=False)
 
 
 def status():
@@ -400,6 +491,13 @@ def status():
     print(f"os-release: {release.get('PRETTY_NAME', '?')} (ID={release.get('ID')}, "
           f"VERSION_ID={release.get('VERSION_ID')}, LOGO={release.get('LOGO')})")
     print("logos:", "installed" if (ICONS / "bedrock-logo.svg").is_file() else "missing")
+    compiled = distributor_logos()
+    if compiled:
+        branded = all(logo_backup(path).is_file() for path, _ in compiled)
+        names = ", ".join(path.name for path, _ in compiled)
+        print("About page:", f"Bedrock wordmark ({names})" if branded else f"distro logo ({names}); run apply")
+    else:
+        print("About page: follows LOGO")
     theme = run("plymouth-set-default-theme", capture=True, check=False)
     print("boot splash:", theme.stdout.strip() if theme else "plymouth not installed")
     labels = [label for _, label, path in efi_entries() if EFI_LOADER.lower() in path.lower()]
@@ -408,10 +506,11 @@ def status():
 
 def revert():
     require_root()
-    for path in UNITS:
+    for path in [*UNITS, str(PATH_UNIT)]:
         run("systemctl", "disable", "--now", Path(path).name, check=False)
         Path(path).unlink(missing_ok=True)
     run("systemctl", "daemon-reload")
+    restore_distributor_logos()
     if OS_RELEASE.exists() and not OS_RELEASE.is_symlink():
         tempfile_path = OS_RELEASE.with_name(".os-release.brl-brand")
         tempfile_path.unlink(missing_ok=True)
