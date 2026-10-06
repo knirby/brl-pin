@@ -1,0 +1,20 @@
+#!/bin/sh
+# install - install brl-pin, brl-desktop and brl-brand with their assets
+#
+# Copies the tools to /usr/local/bin and the logos brl-brand uses to
+# /usr/local/share/brl-tools/assets. Safe to rerun; it only overwrites the
+# files it installs and changes no configuration. Run each tool's own setup
+# afterwards (brl-desktop enable, brl-brand apply).
+set -eu
+if [ "$(id -u)" -ne 0 ]; then
+	echo "error: run as root: sudo ./install" >&2
+	exit 1
+fi
+cd "$(dirname "$0")"
+install -D -m 755 -t /usr/local/bin brl-pin brl-desktop brl-brand
+install -D -m 644 -t /usr/local/share/brl-tools/assets assets/*.svg
+echo "Installed brl-pin, brl-desktop and brl-brand to /usr/local/bin."
+if systemctl --quiet is-active brl-desktop.service 2>/dev/null; then
+	systemctl restart brl-desktop.service
+	echo "Restarted brl-desktop.service."
+fi

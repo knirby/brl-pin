@@ -24,7 +24,7 @@ import tempfile
 from pathlib import Path
 
 CONF = Path("/bedrock/etc/bedrock.conf")
-REPOSITORY = "https://github.com/knirby/brl-pin.git"
+REPOSITORY = "https://github.com/knirby/brl-tools.git"
 
 def die(msg: str, code: int = 1):
     print(f"error: {msg}", file=sys.stderr)

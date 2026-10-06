@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+"""
+brl-desktop - live, clean desktop integration for apps from every Bedrock stratum
+
+Usage:
+    brl-desktop sync              # rebuild entries and icons once (root)
+    brl-desktop watch             # rebuild whenever a stratum's apps change (root)
+    brl-desktop status            # show what each stratum contributes
+    brl-desktop prune             # tidy this user's launcher overrides once
+    brl-desktop watch --user      # tidy them whenever an app is uninstalled
+    brl-desktop enable            # configure Bedrock and start the services (root)
+    brl-desktop disable           # undo `enable` (root)
+
+Bedrock's crossfs shows other strata's launchers under /bedrock/cross, a FUSE
+mount. FUSE raises no inotify events for changes made beneath it, so desktops
+never hear that an app was installed or removed, and the merged hicolor
+directory carries one stratum's icon cache, which hides every other stratum's
+icons.
+
+brl-desktop replaces crossfs's launchers with real files in one directory
+placed first in XDG_DATA_DIRS. Each launcher runs its app through strat, icons
+from every stratum land in one hicolor theme with a fresh cache, and
+update-desktop-database lists every app's MIME types. The root watcher
+rebuilds within seconds of a package manager touching a stratum; desktops pick
+the change up through inotify like any native install.
+
+When two strata offer the same app, the stratum its command is pinned to wins
+(see brl-pin), then the init stratum, then [cross] priority in bedrock.conf.
+The per-user watcher moves a launcher override, such as a menu editor's copy,
+to ~/.local/share/brl-desktop/orphans once the app it overrides is gone.
+"""
+
+import ctypes
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+CONF = Path("/bedrock/etc/bedrock.conf")
+STRATA = Path("/bedrock/strata")
+ENABLED = Path("/bedrock/run/enabled_strata")
+ROOT = Path(os.environ.get("BRL_DESKTOP_ROOT", "/bedrock/var/brl-desktop"))
+SHARE = ROOT / "share"
+APPS = SHARE / "applications"
+HICOLOR = SHARE / "icons" / "hicolor"
+STATE = ROOT / "state.json"
+STRAT = "/bedrock/bin/strat"
+
+UNITS = {
+    "/etc/systemd/system/brl-desktop.service": """\
+[Unit]
+Description=Bedrock desktop entries and icons from every stratum
+After=local-fs.target
+Before=display-manager.service systemd-user-sessions.service
+
+[Service]
+Type=exec
+ExecStartPre=/usr/local/bin/brl-desktop sync
+ExecStart=/usr/local/bin/brl-desktop watch
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+""",
+    "/etc/systemd/user/brl-desktop-prune.service": """\
+[Unit]
+Description=Remove launcher overrides for uninstalled apps
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/brl-desktop watch --user
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+""",
+}
+
+CONF_MARK = "# brl-desktop:"
+APPS_LINE = re.compile(r"^(\s*)applications(\s*)=(\s*)\$XDG_DATA_DIRS/applications\s*$")
+XDG_PREFIX = re.compile(r"^(\s*PREFIX:XDG_DATA_DIRS\s*=\s*)(.*)$")
+
+STRATUM_PATH = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+WRAPPERS = {"env", "sh", "bash", "dash", "zsh", "flatpak", "gio", "xdg-open", "exo-open",
+            "python", "python3", "java", "mono", "wine", "steam", "snap", "pkexec", "sudo"}
+ICON_EXTENSIONS = (".png", ".svg", ".svgz", ".xpm")
+SHARED_PREFIXES = ("/home", "/root", "/tmp", "/mnt", "/media", "/run", "/bedrock")
+
+
+def die(message, code=1):
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def require_root():
+    if os.geteuid() != 0:
+        die("This operation requires root. Re-run with sudo.")
+
+
+# ---------------------------------------------------------------------------
+# Bedrock state
+
+def read_conf():
+    try:
+        return CONF.read_text()
+    except OSError as error:
+        die(f"Failed to read {CONF}: {error}")
+
+
+def conf_sections(content):
+    sections, current = {}, None
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = stripped[1:-1]
+            sections.setdefault(current, [])
+        elif current and "=" in stripped:
+            key, value = stripped.split("=", 1)
+            sections[current].append((key.strip(), value.strip()))
+    return sections
+
+
+def pins(sections):
+    result = {}
+    for key, value in sections.get("cross-bin", []):
+        if key.startswith("pin/bin/") and ":" in value:
+            stratum = value.split(":", 1)[0]
+            if stratum not in {"init", "local"}:
+                result[key[len("pin/bin/"):]] = stratum
+    return result
+
+
+def init_stratum():
+    """Name the stratum providing init; /bedrock/strata/init is a bind of it."""
+    try:
+        return os.getxattr(STRATA / "init", "user.bedrock.stratum").decode()
+    except OSError:
+        die("Cannot tell which stratum provides init.")
+
+
+def shown_strata(sections):
+    """Enabled strata whose files Bedrock shows across strata, in priority order."""
+    try:
+        enabled = sorted(entry.name for entry in ENABLED.iterdir())
+    except OSError:
+        enabled = []
+    shown = []
+    for name in enabled:
+        if name == "bedrock":
+            continue
+        try:
+            os.getxattr(STRATA / name, "user.bedrock.show_cross")
+        except OSError:
+            continue
+        shown.append(name)
+    priority = []
+    for key, value in sections.get("cross", []):
+        if key == "priority":
+            priority = [item.strip() for item in value.split(",") if item.strip()]
+    priority = [stratum for stratum in priority if stratum in shown]
+    return priority + [stratum for stratum in shown if stratum not in priority]
+
+
+def application_dirs(stratum):
+    root = STRATA / stratum
+    return [root / "usr/local/share/applications", root / "usr/share/applications"]
+
+
+def icon_dirs(stratum):
+    root = STRATA / stratum
+    return [root / "usr/local/share/icons/hicolor", root / "usr/share/icons/hicolor"]
+
+
+# ---------------------------------------------------------------------------
+# Desktop entries
+
+class Entry:
+    def __init__(self, stratum, base, path):
+        self.stratum = stratum
+        self.base = base
+        self.path = path
+        self.id = str(path.relative_to(base)).replace("/", "-")
+        self.text = path.read_text(errors="replace")
+        self.fields = desktop_fields(self.text)
+        self.command = command_name(self.fields.get("Exec", ""))
+
+    @property
+    def visible(self):
+        fields = self.fields
+        return (fields.get("Type", "Application") == "Application"
+                and fields.get("NoDisplay", "false").lower() != "true"
+                and fields.get("Hidden", "false").lower() != "true")
+
+
+def desktop_fields(text):
+    fields, in_entry = {}, False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_entry = stripped == "[Desktop Entry]"
+        elif in_entry and "=" in stripped and not stripped.startswith("#"):
+            key, value = stripped.split("=", 1)
+            fields.setdefault(key.strip(), value.strip())
+    return fields
+
+
+def command_name(exec_line):
+    try:
+        tokens = shlex.split(exec_line)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    name = Path(tokens[0]).name
+    return None if name in WRAPPERS else name
+
+
+def entries_in(stratum, directory):
+    if not directory.is_dir():
+        return []
+    found = []
+    for current, subdirs, files in os.walk(directory):
+        subdirs.sort()
+        for name in sorted(files):
+            if name.endswith(".desktop"):
+                try:
+                    found.append(Entry(stratum, directory, Path(current) / name))
+                except OSError:
+                    pass
+    return found
+
+
+def find_in_stratum(stratum, program):
+    root = STRATA / stratum
+    if program.startswith("/"):
+        candidate = root / program.lstrip("/")
+        return candidate if os.access(candidate, os.X_OK) else None
+    for directory in STRATUM_PATH:
+        candidate = root / directory.lstrip("/") / program
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def icon_names(stratum):
+    names = set()
+    for directory in icon_dirs(stratum):
+        if directory.is_dir():
+            for _, _, files in os.walk(directory):
+                names.update(Path(name).stem for name in files if name.endswith(ICON_EXTENSIONS))
+    return names
+
+
+def resolve_icon(stratum, icon, themed):
+    """Return the Icon= value a launcher from this stratum should carry."""
+    root = STRATA / stratum
+    if not icon:
+        return icon
+    if icon.startswith("/"):
+        candidate = root / icon.lstrip("/")
+        return str(candidate) if candidate.exists() else icon
+    if icon in themed:
+        return icon
+    for directory in ("usr/share/pixmaps", "usr/local/share/pixmaps"):
+        for extension in ("", *ICON_EXTENSIONS):
+            candidate = root / directory / f"{icon}{extension}"
+            if candidate.is_file():
+                return str(candidate)
+    themes = root / "usr/share/icons"
+    if themes.is_dir():
+        matches = sorted(themes.glob(f"*/scalable/*/{icon}.svg")) or sorted(
+            themes.glob(f"*/*/*/{icon}.png"), key=lambda path: path.parts[-3], reverse=True)
+        if matches:
+            return str(matches[0])
+    return icon
+
+
+def rewrite(entry, themed):
+    """Return the launcher text for an entry, running it inside its stratum."""
+    stratum = entry.stratum
+    root = STRATA / stratum
+    lines, out, in_entry, group = entry.text.splitlines(), [], False, None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_entry:
+                out += provenance(entry)
+            group = stripped
+            in_entry = group == "[Desktop Entry]"
+            out.append(line)
+            continue
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or stripped.startswith("#") or group is None:
+            out.append(line)
+            continue
+        if key == "Exec":
+            out.append(f"Exec={STRAT} {stratum} {value.strip()}")
+        elif key in {"TryExec", "DBusActivatable"} and in_entry:
+            continue
+        elif key in {"X-Bedrock-Stratum", "X-Bedrock-Source"}:
+            continue
+        elif key == "Icon" and in_entry:
+            out.append(f"Icon={resolve_icon(stratum, value.strip(), themed)}")
+        elif key == "Path" and in_entry and value.strip().startswith("/") \
+                and not value.strip().startswith(SHARED_PREFIXES):
+            out.append(f"Path={root / value.strip().lstrip('/')}")
+        else:
+            out.append(line)
+    if in_entry:
+        out += provenance(entry)
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def provenance(entry):
+    return [f"X-Bedrock-Stratum={entry.stratum}",
+            f"X-Bedrock-Source=/{entry.path.relative_to(STRATA / entry.stratum)}"]
+
+
+def hidden_entry(native, winner):
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={native.fields.get('Name', native.id)}\n"
+        "Hidden=true\n"
+        f"X-Bedrock-Stratum={native.stratum}\n"
+        f"X-Bedrock-Hidden-By={winner.stratum}:{winner.id}\n"
+    )
+
+
+def runnable(entry):
+    try_exec = entry.fields.get("TryExec")
+    if try_exec and not find_in_stratum(entry.stratum, try_exec):
+        return False
+    try:
+        tokens = shlex.split(entry.fields.get("Exec", ""))
+    except ValueError:
+        return False
+    if entry.fields.get("Type", "Application") != "Application":
+        return True
+    return bool(tokens) and find_in_stratum(entry.stratum, tokens[0]) is not None
+
+
+# ---------------------------------------------------------------------------
+# Planning
+
+def plan():
+    """Work out every launcher to write, and the icon files to link."""
+    sections = conf_sections(read_conf())
+    pinned = pins(sections)
+    native = init_stratum()
+    strata = shown_strata(sections)
+    foreign = [stratum for stratum in strata if stratum != native]
+    rank = {stratum: index for index, stratum in enumerate(foreign)}
+
+    native_entries = [entry for directory in application_dirs(native)
+                      for entry in entries_in(native, directory)]
+    native_ids = {entry.id for entry in native_entries}
+    native_by_command = {}
+    for entry in native_entries:
+        if entry.visible and entry.command:
+            native_by_command.setdefault(entry.command, []).append(entry)
+
+    candidates = {}
+    for stratum in foreign:
+        themed = icon_names(stratum)
+        for directory in application_dirs(stratum):
+            for entry in entries_in(stratum, directory):
+                if runnable(entry):
+                    entry.themed = themed
+                    candidates.setdefault(entry.id, []).append(entry)
+
+    def is_pinned(entry):
+        return entry.command is not None and pinned.get(entry.command) == entry.stratum
+
+    def order(entry):
+        return (0 if is_pinned(entry) else 1, rank[entry.stratum])
+
+    winners = {}
+    for entry_id, group in candidates.items():
+        best = min(group, key=order)
+        if entry_id in native_ids and not is_pinned(best):
+            continue
+        if best.visible and best.command in native_by_command and not is_pinned(best):
+            continue
+        winners[entry_id] = best
+
+    by_command = {}
+    for entry in winners.values():
+        if entry.visible and entry.command:
+            by_command.setdefault(entry.command, []).append(entry)
+    for group in by_command.values():
+        keep = min(group, key=order)
+        for entry in group:
+            if entry is not keep:
+                winners.pop(entry.id, None)
+
+    files = {entry_id: rewrite(entry, entry.themed) for entry_id, entry in winners.items()}
+    for entry in winners.values():
+        if is_pinned(entry):
+            for loser in native_by_command.get(entry.command, []):
+                if loser.id != entry.id and loser.id not in files:
+                    files[loser.id] = hidden_entry(loser, entry)
+
+    icons = {}
+    native_icons = set()
+    for directory in icon_dirs(native):
+        if directory.is_dir():
+            for path in directory.rglob("*"):
+                if path.is_file():
+                    native_icons.add(str(path.relative_to(directory)))
+    for stratum in foreign:
+        for directory in icon_dirs(stratum):
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.rglob("*")):
+                if not path.name.endswith(ICON_EXTENSIONS) or not path.is_file():
+                    continue
+                relative = str(path.relative_to(directory))
+                if relative not in native_icons:
+                    icons.setdefault(relative, path)
+
+    sources = {entry_id: f"{entry.stratum}:{entry.path}" for entry_id, entry in winners.items()}
+    return native, foreign, files, icons, sources
+
+
+# ---------------------------------------------------------------------------
+# Writing
+
+def write_if_changed(path, content):
+    try:
+        if path.read_text() == content:
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(content)
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, path)
+    return True
+
+
+def link_if_changed(path, target):
+    try:
+        if os.readlink(path) == str(target):
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    if temporary.is_symlink() or temporary.exists():
+        temporary.unlink()
+    os.symlink(target, temporary)
+    os.replace(temporary, path)
+    return True
+
+
+def prune_tree(directory, keep):
+    removed = 0
+    if not directory.is_dir():
+        return removed
+    for path in sorted(directory.rglob("*"), reverse=True):
+        relative = str(path.relative_to(directory))
+        if path.is_dir() and not path.is_symlink():
+            if not any(path.iterdir()):
+                path.rmdir()
+        elif relative not in keep:
+            path.unlink()
+            removed += 1
+    return removed
+
+
+def icon_index(native):
+    """Write a hicolor index.theme listing every directory now holding icons."""
+    base = STRATA / native / "usr/share/icons/hicolor/index.theme"
+    try:
+        text = base.read_text()
+    except OSError:
+        text = "[Icon Theme]\nName=Hicolor\nComment=Fallback icon theme\nHidden=true\nDirectories=\n"
+    listed = []
+    for line in text.splitlines():
+        if line.startswith("Directories="):
+            listed = [item for item in line.split("=", 1)[1].split(",") if item]
+    present = sorted({str(path.parent.relative_to(HICOLOR))
+                      for path in HICOLOR.rglob("*") if path.is_symlink()})
+    extra = [directory for directory in present if directory not in listed]
+    if not extra:
+        return text
+    sections = []
+    for directory in extra:
+        size_part, _, context = directory.partition("/")
+        match = re.fullmatch(r"(\d+)x\d+(?:@(\d+))?", size_part)
+        section = [f"[{directory}]", f"Context={context.capitalize() or 'Applications'}"]
+        if match:
+            section += [f"Size={match.group(1)}", "Type=Fixed"]
+            if match.group(2):
+                section.append(f"Scale={match.group(2)}")
+        else:
+            section += ["Size=128", "MinSize=8", "MaxSize=512", "Type=Scalable"]
+        sections.append("\n".join(section))
+    text = re.sub(r"^Directories=.*$", "Directories=" + ",".join(listed + extra), text,
+                  count=1, flags=re.M)
+    return text.rstrip("\n") + "\n\n" + "\n\n".join(sections) + "\n"
+
+
+def run_quietly(*command):
+    try:
+        subprocess.run(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        pass
+
+
+def sync(verbose=True):
+    native, foreign, files, icons, sources = plan()
+    changed = 0
+    for entry_id, content in files.items():
+        changed += write_if_changed(APPS / entry_id, content)
+    removed = prune_tree(APPS, set(files) | {"mimeinfo.cache"})
+
+    icon_changes = sum(link_if_changed(HICOLOR / relative, target)
+                       for relative, target in icons.items())
+    icon_removed = prune_tree(HICOLOR, set(icons) | {"index.theme", "icon-theme.cache"})
+    if icon_changes or icon_removed or not (HICOLOR / "icon-theme.cache").exists():
+        HICOLOR.mkdir(parents=True, exist_ok=True)
+        write_if_changed(HICOLOR / "index.theme", icon_index(native))
+        run_quietly("gtk-update-icon-cache", "--force", "--quiet", str(HICOLOR))
+    if changed or removed or not (APPS / "mimeinfo.cache").exists():
+        APPS.mkdir(parents=True, exist_ok=True)
+        run_quietly("update-desktop-database", "--quiet", str(APPS))
+
+    state = {"native": native, "foreign": foreign, "entries": sources,
+             "hidden": sorted(entry_id for entry_id, content in files.items()
+                              if "\nHidden=true\n" in content),
+             "icons": len(icons), "updated": datetime.now().isoformat(timespec="seconds")}
+    write_if_changed(STATE, json.dumps(state, indent=1, sort_keys=True) + "\n")
+    if verbose or changed or removed or icon_changes or icon_removed:
+        log(f"sync: {len(files)} launchers ({changed} written, {removed} removed), "
+            f"{len(icons)} icons ({icon_changes} linked, {icon_removed} removed) "
+            f"from {', '.join(foreign) or 'no other strata'}")
+
+
+# ---------------------------------------------------------------------------
+# inotify
+
+IN_ATTRIB, IN_CLOSE_WRITE, IN_MOVED_FROM, IN_MOVED_TO = 0x4, 0x8, 0x40, 0x80
+IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_ISDIR = 0x100, 0x200, 0x400, 0x40000000
+WATCH_MASK = (IN_ATTRIB | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO
+              | IN_CREATE | IN_DELETE | IN_DELETE_SELF)
+
+
+class Inotify:
+    def __init__(self):
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            die(f"inotify_init1 failed: {os.strerror(ctypes.get_errno())}")
+        self.watches = {}
+
+    def add(self, path, recursive=False):
+        paths = [path]
+        if recursive:
+            paths += [Path(current) / name for current, subdirs, _ in os.walk(path)
+                      for name in subdirs]
+        for directory in paths:
+            if str(directory) in self.watches.values():
+                continue
+            wd = self.libc.inotify_add_watch(self.fd, os.fsencode(directory), WATCH_MASK)
+            if wd >= 0:
+                self.watches[wd] = str(directory)
+
+    def reset(self):
+        for wd in list(self.watches):
+            self.libc.inotify_rm_watch(self.fd, wd)
+        self.watches.clear()
+
+    def wait(self, timeout):
+        """Return the directories created and whether anything changed."""
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return [], False
+        created = []
+        try:
+            data = os.read(self.fd, 1 << 16)
+        except BlockingIOError:
+            return [], False
+        offset = 0
+        while offset + 16 <= len(data):
+            wd, mask, _, length = (int.from_bytes(data[offset + i:offset + i + 4], "little")
+                                   for i in (0, 4, 8, 12))
+            name = data[offset + 16:offset + 16 + length].split(b"\0", 1)[0]
+            offset += 16 + length
+            if mask & IN_ISDIR and mask & (IN_CREATE | IN_MOVED_TO) and wd in self.watches:
+                created.append(Path(self.watches[wd]) / os.fsdecode(name))
+        return created, True
+
+
+def debounce(inotify, on_created, quiet=1.5, longest=10.0):
+    start = last = time.monotonic()
+    while True:
+        remaining = min(quiet - (time.monotonic() - last), longest - (time.monotonic() - start))
+        if remaining <= 0:
+            return
+        created, changed = inotify.wait(remaining)
+        for directory in created:
+            on_created(directory)
+        if changed:
+            last = time.monotonic()
+
+
+def watch_system():
+    require_root()
+    inotify = Inotify()
+
+    def arm():
+        inotify.reset()
+        sections = conf_sections(read_conf())
+        inotify.add(CONF.parent)
+        if ENABLED.is_dir():
+            inotify.add(ENABLED)
+        for stratum in shown_strata(sections):
+            root = STRATA / stratum
+            for share in (root / "usr/share", root / "usr/local/share"):
+                if share.is_dir():
+                    inotify.add(share)
+            for directory in application_dirs(stratum) + icon_dirs(stratum):
+                if directory.is_dir():
+                    inotify.add(directory, recursive=True)
+            pixmaps = root / "usr/share/pixmaps"
+            if pixmaps.is_dir():
+                inotify.add(pixmaps)
+        return tuple(shown_strata(sections))
+
+    strata = arm()
+    sync()
+    log(f"watching {len(inotify.watches)} directories across {', '.join(strata)}")
+    while True:
+        created, changed = inotify.wait(300)
+        if not changed and not created:
+            sync(verbose=False)
+            continue
+        for directory in created:
+            inotify.add(directory, recursive=True)
+        debounce(inotify, lambda directory: inotify.add(directory, recursive=True))
+        try:
+            sync(verbose=False)
+        except Exception as error:
+            log(f"sync failed: {error}")
+        current = tuple(shown_strata(conf_sections(read_conf())))
+        if current != strata:
+            strata = arm()
+            log(f"strata changed; watching {len(inotify.watches)} directories")
+
+
+# ---------------------------------------------------------------------------
+# Per-user pruning
+
+def user_paths():
+    home = Path.home()
+    data_home = Path(os.environ.get("XDG_DATA_HOME", home / ".local/share"))
+    state_home = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state"))
+    return data_home / "applications", state_home / "brl-desktop" / "seen.json", \
+        data_home / "brl-desktop" / "orphans"
+
+
+def system_app_dirs():
+    raw = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    dirs = [Path(item) / "applications" for item in raw.split(":") if item]
+    if APPS not in dirs:
+        dirs.insert(0, APPS)
+    return [directory for directory in dirs if directory.is_dir()]
+
+
+def provided_ids():
+    """Desktop IDs the system offers, first directory wins, hidden ones excluded."""
+    seen, provided = set(), set()
+    for directory in system_app_dirs():
+        for current, _, files in os.walk(directory):
+            for name in files:
+                if not name.endswith(".desktop"):
+                    continue
+                path = Path(current) / name
+                entry_id = str(path.relative_to(directory)).replace("/", "-")
+                if entry_id in seen:
+                    continue
+                seen.add(entry_id)
+                try:
+                    hidden = desktop_fields(path.read_text(errors="replace")) \
+                        .get("Hidden", "false").lower() == "true"
+                except OSError:
+                    continue
+                if not hidden:
+                    provided.add(entry_id)
+    return provided
+
+
+def refresh_user_icon_caches():
+    """Rebuild a user icon theme's cache once anything beneath it changed.
+
+    GTK trusts a theme's icon-theme.cache over the disk and compares it only
+    with the theme's top directory. Deleting icons from a size directory such
+    as 256x256/apps leaves a cache naming files that no longer exist, and
+    launchers using those names draw nothing at all.
+    """
+    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    for cache in sorted((data_home / "icons").glob("*/icon-theme.cache")):
+        theme = cache.parent
+        built = cache.stat().st_mtime
+        if any(path.stat().st_mtime > built for path in theme.rglob("*")
+               if path.is_dir() and not path.is_symlink()):
+            run_quietly("gtk-update-icon-cache", "--force", "--ignore-theme-index",
+                        "--quiet", str(theme))
+            log(f"prune: rebuilt the stale icon cache in {theme}")
+
+
+def refresh_user_mime_cache(applications):
+    """Rebuild ~/.local/share/applications/mimeinfo.cache once a launcher is newer.
+
+    GLib takes a directory's MIME registrations from its mimeinfo.cache, and a
+    launcher there masks the system copy with the same ID. Menu editors write
+    such overrides without refreshing the cache, so an app whose icon was
+    changed stops being registered for its MIME types: GNOME Files, for one,
+    stops handling folders.
+    """
+    cache = applications / "mimeinfo.cache"
+    if not cache.is_file():
+        return
+    built = cache.stat().st_mtime
+    if any(path.stat().st_mtime > built for path in applications.rglob("*.desktop")):
+        run_quietly("update-desktop-database", "--quiet", str(applications))
+        log(f"prune: rebuilt the stale MIME cache in {applications}")
+
+
+def prune(verbose=True):
+    refresh_user_icon_caches()
+    applications, state_file, orphans = user_paths()
+    refresh_user_mime_cache(applications)
+    provided = provided_ids()
+    try:
+        state = json.loads(state_file.read_text())
+    except (OSError, ValueError):
+        state = {}
+    previous = set(state.get("provided", []))
+    strata = sorted(ENABLED.iterdir()) if ENABLED.is_dir() else []
+    strata = [entry.name for entry in strata]
+
+    moved = []
+    if previous and state.get("strata") == strata and len(provided) >= len(previous) // 2:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        for entry_id in sorted(previous - provided):
+            override = applications / entry_id
+            if override.is_file():
+                target = orphans / stamp / entry_id
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(override), target)
+                moved.append(entry_id)
+    elif previous and verbose:
+        log("prune: strata changed or many apps vanished at once; recording state only")
+
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps({"provided": sorted(provided), "strata": strata}) + "\n")
+    for entry_id in moved:
+        log(f"prune: {entry_id} was uninstalled; moved your override to {orphans}")
+    if verbose and not moved:
+        log(f"prune: {len(provided)} system launchers, no stale overrides")
+
+
+def watch_user():
+    inotify = Inotify()
+
+    def arm():
+        inotify.reset()
+        for directory in system_app_dirs():
+            inotify.add(directory, recursive=True)
+        if ENABLED.is_dir():
+            inotify.add(ENABLED)
+        applications = user_paths()[0]
+        if applications.is_dir():
+            inotify.add(applications)
+
+    arm()
+    prune()
+    while True:
+        created, changed = inotify.wait(600)
+        if changed or created:
+            debounce(inotify, lambda directory: inotify.add(directory, recursive=True), quiet=3)
+        try:
+            prune(verbose=False)
+        except Exception as error:
+            log(f"prune failed: {error}")
+        arm()
+
+
+# ---------------------------------------------------------------------------
+# Status, enable, disable
+
+def status():
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        die("No state yet. Run `sudo brl-desktop sync` or `sudo brl-desktop enable`.")
+    print(f"init stratum: {state['native']} (its launchers are used directly)")
+    print(f"other strata: {', '.join(state['foreign']) or '(none)'}")
+    print(f"launchers in {APPS}: {len(state['entries'])}, icons: {state['icons']}, "
+          f"updated {state['updated']}")
+    by_stratum = {}
+    for entry_id, source in sorted(state["entries"].items()):
+        by_stratum.setdefault(source.split(":", 1)[0], []).append(entry_id)
+    for stratum, ids in by_stratum.items():
+        print(f"  {stratum}: {', '.join(ids)}")
+    if state["hidden"]:
+        print(f"hidden in favour of a pinned stratum: {', '.join(state['hidden'])}")
+    environment = os.environ.get("XDG_DATA_DIRS", "")
+    if str(SHARE) not in environment.split(":"):
+        print(f"note: {SHARE} is not in this session's XDG_DATA_DIRS yet; log out and back in.")
+
+
+def configure(content, enable):
+    out = []
+    for line in content.splitlines():
+        if enable and APPS_LINE.match(line):
+            out.append(f"{CONF_MARK} {line.strip()}")
+            continue
+        if not enable and line.startswith(f"{CONF_MARK} applications"):
+            out.append(line[len(CONF_MARK) + 1:])
+            continue
+        match = XDG_PREFIX.match(line)
+        if match:
+            items = [item for item in match.group(2).split(":") if item and item != str(SHARE)]
+            if enable:
+                items.insert(0, str(SHARE))
+            line = match.group(1) + ":".join(items)
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def brl_apply():
+    try:
+        subprocess.run(["brl", "apply"], check=True)
+    except (OSError, subprocess.CalledProcessError):
+        die("`brl apply` failed. Check the output above.")
+
+
+def systemctl(*arguments):
+    subprocess.run(["systemctl", *arguments], check=False)
+
+
+def enable():
+    require_root()
+    content = read_conf()
+    updated = configure(content, enable=True)
+    if updated != content:
+        shutil.copy2(CONF, CONF.with_name("bedrock.conf.brl-desktop-backup"))
+        CONF.write_text(updated)
+        log(f"updated {CONF} (backup: bedrock.conf.brl-desktop-backup)")
+        brl_apply()
+    for path, unit in UNITS.items():
+        write_if_changed(Path(path), unit)
+    systemctl("daemon-reload")
+    systemctl("enable", "--now", "brl-desktop.service")
+    systemctl("--global", "enable", "brl-desktop-prune.service")
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        subprocess.run(["systemctl", f"--machine={sudo_user}@.host", "--user", "start",
+                        "brl-desktop-prune.service"], check=False)
+    log("enabled. Log out and back in once so your session picks up the new XDG_DATA_DIRS.")
+
+
+def disable():
+    require_root()
+    systemctl("--global", "disable", "brl-desktop-prune.service")
+    systemctl("disable", "--now", "brl-desktop.service")
+    for path in UNITS:
+        Path(path).unlink(missing_ok=True)
+    systemctl("daemon-reload")
+    content = read_conf()
+    updated = configure(content, enable=False)
+    if updated != content:
+        CONF.write_text(updated)
+        brl_apply()
+    shutil.rmtree(SHARE, ignore_errors=True)
+    STATE.unlink(missing_ok=True)
+    log("disabled. crossfs launchers are back after your next login.")
+
+
+def main():
+    args = sys.argv[1:]
+    commands = {
+        ("sync",): lambda: (require_root(), sync()),
+        ("watch",): watch_system,
+        ("watch", "--user"): watch_user,
+        ("prune",): prune,
+        ("status",): status,
+        ("enable",): enable,
+        ("disable",): disable,
+    }
+    command = commands.get(tuple(args))
+    if command is None:
+        print(__doc__.strip())
+        sys.exit(1)
+    try:
+        command()
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

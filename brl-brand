@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""
+brl-brand - present a hijacked install as Bedrock Linux, from boot to desktop
+
+Usage:
+    brl-brand apply       # brand everything and rebuild the boot splash (root)
+    brl-brand refresh     # rewrite os-release only; run after updates (root)
+    brl-brand status      # show what is branded
+    brl-brand revert      # restore the hijacked distro's own branding (root)
+
+A hijack keeps the original distro's identity: os-release, the boot splash,
+boot menu titles and the firmware boot entry all still name it. brl-brand
+rebrands each of them in the init stratum, the one that boots the machine and
+runs the session:
+
+  os-release     NAME, PRETTY_NAME, VERSION, LOGO and URLs become Bedrock's.
+                 ID and VERSION_ID keep the distro's values, which its package
+                 manager, dracut and kernel-install key on. Desktops read
+                 PRETTY_NAME and LOGO for their About pages.
+  logos          bedrock-logo, -text and -text-dark in the hicolor theme under
+                 /usr/local, the names freedesktop About pages look up from
+                 LOGO, plus PNG copies in /usr/local/share/pixmaps.
+  boot splash    a Plymouth theme showing the Bedrock logo, built on the
+                 distro's spinner theme, then every initramfs rebuilt through
+                 kernel-install and checked before it is kept.
+  boot menu      kernel-install titles boot entries from PRETTY_NAME, so the
+                 rebuild retitles them; the firmware entry for systemd-boot is
+                 relabelled "Bedrock Linux".
+
+A path unit reruns `refresh` when a package update replaces the distro's
+os-release or `brl update` changes Bedrock's release.
+
+The logos are drawn by assets/make-logos.py from Bedrock's ASCII logo.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+NAME = "Bedrock Linux"
+URLS = {
+    "HOME_URL": "https://bedrocklinux.org/",
+    "DOCUMENTATION_URL": "https://bedrocklinux.org/0.7/",
+    "SUPPORT_URL": "https://bedrocklinux.org/",
+    "BUG_REPORT_URL": "https://github.com/bedrocklinux/bedrocklinux-userland/issues",
+}
+LOGO = "bedrock-logo"
+DROPPED = {"VARIANT", "VARIANT_ID", "VERSION_CODENAME", "ANSI_COLOR", "IMAGE_ID", "IMAGE_VERSION"}
+
+BEDROCK_RELEASE = Path("/bedrock/strata/bedrock/etc/os-release")
+OS_RELEASE = Path("/etc/os-release")
+VENDOR_OS_RELEASE = Path("/usr/lib/os-release")
+ICONS = Path("/usr/local/share/icons/hicolor/scalable/apps")
+PIXMAPS = Path("/usr/local/share/pixmaps")
+THEMES = Path("/usr/share/plymouth/themes")
+THEME = THEMES / "bedrock"
+BASE_THEME = THEMES / "spinner"
+STATE = Path("/var/lib/brl-brand")
+EFI_LABEL = NAME
+EFI_LOADER = r"\EFI\systemd\systemd-bootx64.efi"
+
+ASSET_DIRS = [
+    Path(os.environ["BRL_BRAND_ASSETS"]) if os.environ.get("BRL_BRAND_ASSETS") else None,
+    Path("/usr/local/share/brl-tools/assets"),
+    Path(__file__).resolve().parent / "assets",
+]
+
+UNITS = {
+    "/etc/systemd/system/brl-brand.service": """\
+[Unit]
+Description=Keep os-release branded as Bedrock Linux
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/brl-brand refresh
+
+[Install]
+WantedBy=multi-user.target
+""",
+    "/etc/systemd/system/brl-brand.path": f"""\
+[Unit]
+Description=Rebrand os-release when an update replaces it
+
+[Path]
+PathChanged={VENDOR_OS_RELEASE}
+PathChanged=/bedrock/etc/bedrock-release
+Unit=brl-brand.service
+
+[Install]
+WantedBy=multi-user.target
+""",
+}
+
+
+def die(message, code=1):
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def require_root():
+    if os.geteuid() != 0:
+        die("This operation requires root. Re-run with sudo.")
+
+
+def run(*command, check=True, capture=False):
+    try:
+        return subprocess.run(command, check=check, text=True,
+                              capture_output=capture)
+    except FileNotFoundError:
+        if check:
+            die(f"`{command[0]}` is not installed.")
+        return None
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or "").strip()
+        die(f"`{' '.join(command)}` failed{': ' + detail if detail else '.'}")
+
+
+def write_atomic(path, content, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(descriptor, "wb" if isinstance(content, bytes) else "w") as handle:
+            handle.write(content)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+# ---------------------------------------------------------------------------
+# os-release
+
+def parse_release(path):
+    fields = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return fields
+    for line in lines:
+        match = re.match(r"^([A-Z0-9_]+)=(.*)$", line.strip())
+        if match:
+            value = match.group(2)
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            fields[match.group(1)] = value
+    return fields
+
+
+def quote(value):
+    if re.fullmatch(r"[A-Za-z0-9._:/-]+", value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+
+
+def branded_release():
+    vendor = parse_release(VENDOR_OS_RELEASE)
+    if not vendor:
+        die(f"Cannot read {VENDOR_OS_RELEASE}.")
+    bedrock = parse_release(BEDROCK_RELEASE)
+    version = bedrock.get("VERSION", "")
+    pretty = bedrock.get("PRETTY_NAME") or f"{NAME} {version}".strip()
+    branded = {"NAME": NAME, "VERSION": version, "PRETTY_NAME": pretty, "LOGO": LOGO, **URLS}
+    out = []
+    order = list(vendor) + [key for key in branded if key not in vendor]
+    for key in order:
+        if key in DROPPED:
+            continue
+        value = branded.get(key, vendor.get(key))
+        if value is not None and value != "":
+            out.append(f"{key}={quote(value)}")
+    out.append(f"BEDROCK_BASE_NAME={quote(vendor.get('PRETTY_NAME', vendor.get('NAME', '')))}")
+    return "\n".join(out) + "\n"
+
+
+def refresh_release():
+    content = branded_release()
+    try:
+        if not OS_RELEASE.is_symlink() and OS_RELEASE.read_text() == content:
+            return False
+    except OSError:
+        pass
+    write_atomic(OS_RELEASE, content)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Logos
+
+def asset(name):
+    for directory in ASSET_DIRS:
+        if directory and (directory / name).is_file():
+            return directory / name
+    die(f"Cannot find {name}. Install the assets with ./install or set BRL_BRAND_ASSETS.")
+
+
+def render(svg, png, width):
+    """Render an SVG to a PNG of the given width."""
+    try:
+        import gi
+        gi.require_version("Rsvg", "2.0")
+        from gi.repository import Rsvg
+        import cairo
+        handle = Rsvg.Handle.new_from_file(str(svg))
+        _, view_width, view_height = handle.get_intrinsic_size_in_pixels()
+        height = round(width * view_height / view_width)
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+        viewport = Rsvg.Rectangle()
+        viewport.x, viewport.y, viewport.width, viewport.height = 0, 0, width, height
+        handle.render_document(cairo.Context(surface), viewport)
+        png.parent.mkdir(parents=True, exist_ok=True)
+        surface.write_to_png(str(png))
+        return
+    except (ImportError, ValueError, AttributeError):
+        pass
+    for command in (["rsvg-convert", "-w", str(width), "-o", str(png), str(svg)],
+                    ["magick", "-background", "none", "-density", "384", str(svg),
+                     "-resize", f"{width}x", str(png)]):
+        if shutil.which(command[0]):
+            png.parent.mkdir(parents=True, exist_ok=True)
+            run(*command)
+            return
+    die("No SVG renderer found: install librsvg (rsvg-convert) or ImageMagick.")
+
+
+def install_logos():
+    for name in ("bedrock-logo.svg", "bedrock-logo-text.svg", "bedrock-logo-text-dark.svg"):
+        write_atomic(ICONS / name, asset(name).read_bytes())
+    render(asset("bedrock-logo.svg"), PIXMAPS / "bedrock-logo.png", 256)
+    render(asset("bedrock-logo-text.svg"), PIXMAPS / "bedrock-logo-text.png", 1200)
+    render(asset("bedrock-logo-text-dark.svg"), PIXMAPS / "bedrock-logo-text-dark.png", 1200)
+    log(f"logos: {ICONS} and {PIXMAPS}")
+
+
+# ---------------------------------------------------------------------------
+# Boot splash
+
+def install_theme():
+    if not BASE_THEME.is_dir():
+        die(f"Plymouth's spinner theme is missing ({BASE_THEME}); install it first.")
+    base = (BASE_THEME / "spinner.plymouth").read_text()
+    THEME.mkdir(parents=True, exist_ok=True)
+    for image in BASE_THEME.glob("*.png"):
+        if image.name != "watermark.png":
+            shutil.copy2(image, THEME / image.name)
+    render(asset("bedrock-linux-logo-dark.svg"), THEME / "watermark.png", 520)
+
+    lines, section = [], None
+    for line in base.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            section = stripped
+        key = stripped.split("=", 1)[0]
+        if section == "[Plymouth Theme]" and key.startswith(("Name", "Description")):
+            continue
+        if section == "[two-step]":
+            if key == "ImageDir":
+                line = f"ImageDir={THEME}"
+            elif key == "WatermarkVerticalAlignment":
+                line = "WatermarkVerticalAlignment=.42"
+            elif key == "VerticalAlignment":
+                line = "VerticalAlignment=.68"
+        lines.append(line)
+        if stripped == "[Plymouth Theme]":
+            lines += [f"Name={NAME}", "Description=The Bedrock Linux logo over the spinner"]
+    write_atomic(THEME / "bedrock.plymouth", "\n".join(lines) + "\n")
+    run("plymouth-set-default-theme", "bedrock")
+    log(f"boot splash: Plymouth theme {THEME}")
+
+
+def boot_entries():
+    result = run("bootctl", "list", "--json=short", capture=True, check=False)
+    if result is None or result.returncode != 0:
+        return []
+    boot = Path(run("bootctl", "--print-boot-path", capture=True).stdout.strip())
+    entries = []
+    for entry in json.loads(result.stdout or "[]"):
+        version, initrd = entry.get("version"), entry.get("initrd") or []
+        if not (version and initrd and (Path("/usr/lib/modules") / version / "vmlinuz").is_file()):
+            continue
+        path = Path(initrd[0])
+        if not path.is_file():
+            path = boot / str(path).lstrip("/")
+        if path.is_file():
+            entries.append((version, path))
+    return entries
+
+
+def initrd_files(path):
+    result = run("lsinitrd", str(path), capture=True, check=False)
+    return result.stdout if result and result.returncode == 0 else ""
+
+
+def rebuild_initrds():
+    """Rebuild every initramfs through kernel-install; restore any that look wrong."""
+    entries = boot_entries()
+    if not entries:
+        log("boot splash: no kernel-install boot entries found; skipping the initramfs rebuild")
+        return
+    backups = STATE / "initrd-backup"
+    backups.mkdir(parents=True, exist_ok=True)
+    for version, initrd in entries:
+        backup = backups / f"{version}.img"
+        shutil.copy2(initrd, backup)
+        log(f"boot splash: rebuilding the initramfs for {version}")
+        run("kernel-install", "add", version, f"/usr/lib/modules/{version}/vmlinuz")
+        listing = initrd_files(initrd)
+        missing = [name for name in ("usr/lib/systemd/systemd", f"{THEME.relative_to('/')}/watermark.png")
+                   if name not in listing]
+        if missing:
+            shutil.copy2(backup, initrd)
+            die(f"The new initramfs for {version} lacks {', '.join(missing)}; "
+                "restored the previous one. Nothing else was changed for this kernel.")
+        backup.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Firmware boot entry
+
+def efi_entries():
+    result = run("efibootmgr", capture=True, check=False)
+    if result is None or result.returncode != 0:
+        return []
+    entries = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"^Boot([0-9A-Fa-f]{4})\*?\s+(.*?)\t(.*)$", line)
+        if match:
+            entries.append((match.group(1), match.group(2).strip(), match.group(3)))
+    return entries
+
+
+def relabel_efi_entry():
+    loader = EFI_LOADER.lower()
+    matching = [entry for entry in efi_entries() if loader in entry[2].lower()]
+    if not matching:
+        log("firmware entry: none points at systemd-boot; skipping")
+        return
+    if any(label == EFI_LABEL for _, label, _ in matching):
+        stale = [number for number, label, _ in matching if label != EFI_LABEL]
+    else:
+        esp = run("bootctl", "--print-esp-path", capture=True).stdout.strip()
+        source = run("findmnt", "-no", "SOURCE", esp, capture=True).stdout.strip()
+        disk = run("lsblk", "-no", "PKNAME", source, capture=True).stdout.strip()
+        part = run("lsblk", "-no", "PARTN", source, capture=True).stdout.strip()
+        if not disk or not part:
+            log(f"firmware entry: cannot tell which disk holds {esp}; skipping")
+            return
+        run("efibootmgr", "--quiet", "--create", "--disk", f"/dev/{disk}", "--part", part,
+            "--label", EFI_LABEL, "--loader", EFI_LOADER)
+        if not any(label == EFI_LABEL for _, label, _ in efi_entries()):
+            die("efibootmgr did not create the new firmware entry; the old one is untouched.")
+        stale = [number for number, _, _ in matching]
+    for number in stale:
+        run("efibootmgr", "--quiet", "--bootnum", number, "--delete-bootnum")
+    log(f'firmware entry: systemd-boot is listed as "{EFI_LABEL}"')
+
+
+# ---------------------------------------------------------------------------
+# Commands
+
+def install_units():
+    for path, unit in UNITS.items():
+        write_atomic(Path(path), unit)
+    run("systemctl", "daemon-reload")
+    run("systemctl", "enable", "brl-brand.service", "brl-brand.path", check=False)
+    run("systemctl", "start", "brl-brand.path", check=False)
+
+
+def apply():
+    require_root()
+    if refresh_release():
+        log(f"os-release: {OS_RELEASE} now names {NAME}")
+    install_logos()
+    install_theme()
+    rebuild_initrds()
+    relabel_efi_entry()
+    install_units()
+    log("done. The splash shows on the next boot; About pages pick up the logo when reopened.")
+
+
+def refresh():
+    require_root()
+    if refresh_release():
+        log(f"os-release: refreshed {OS_RELEASE}")
+
+
+def status():
+    release = parse_release(OS_RELEASE)
+    print(f"os-release: {release.get('PRETTY_NAME', '?')} (ID={release.get('ID')}, "
+          f"VERSION_ID={release.get('VERSION_ID')}, LOGO={release.get('LOGO')})")
+    print("logos:", "installed" if (ICONS / "bedrock-logo.svg").is_file() else "missing")
+    theme = run("plymouth-set-default-theme", capture=True, check=False)
+    print("boot splash:", theme.stdout.strip() if theme else "plymouth not installed")
+    labels = [label for _, label, path in efi_entries() if EFI_LOADER.lower() in path.lower()]
+    print("firmware entry:", ", ".join(labels) or "(no systemd-boot entry)")
+
+
+def revert():
+    require_root()
+    for path in UNITS:
+        run("systemctl", "disable", "--now", Path(path).name, check=False)
+        Path(path).unlink(missing_ok=True)
+    run("systemctl", "daemon-reload")
+    if OS_RELEASE.exists() and not OS_RELEASE.is_symlink():
+        tempfile_path = OS_RELEASE.with_name(".os-release.brl-brand")
+        tempfile_path.unlink(missing_ok=True)
+        os.symlink(os.path.relpath(VENDOR_OS_RELEASE, OS_RELEASE.parent), tempfile_path)
+        os.replace(tempfile_path, OS_RELEASE)
+    run("plymouth-set-default-theme", "--reset", check=False)
+    rebuild_initrds_without_theme()
+    shutil.rmtree(THEME, ignore_errors=True)
+    for name in ("bedrock-logo.svg", "bedrock-logo-text.svg", "bedrock-logo-text-dark.svg"):
+        (ICONS / name).unlink(missing_ok=True)
+    for name in ("bedrock-logo.png", "bedrock-logo-text.png", "bedrock-logo-text-dark.png"):
+        (PIXMAPS / name).unlink(missing_ok=True)
+    log("reverted. The firmware entry keeps its label; rename it with efibootmgr if wanted.")
+
+
+def rebuild_initrds_without_theme():
+    for version, _ in boot_entries():
+        run("kernel-install", "add", version, f"/usr/lib/modules/{version}/vmlinuz")
+
+
+def main():
+    commands = {"apply": apply, "refresh": refresh, "status": status, "revert": revert}
+    if len(sys.argv) != 2 or sys.argv[1] not in commands:
+        print(__doc__.strip())
+        sys.exit(1)
+    commands[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

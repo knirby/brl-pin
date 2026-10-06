@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128.00 128.00">
+  <title>Bedrock Linux</title>
+  <rect x="1" y="1" width="126" height="126" rx="28.2" fill="#2b2b30" stroke="#ffffff1f" stroke-width="2"/>
+  <path d="M24.32 29.99 L46.99 29.99 M24.32 29.99 L35.66 52.66 M46.99 29.99 L58.33 52.66 M58.33 52.66 L92.34 52.66 M35.66 52.66 L46.99 75.34 M92.34 52.66 L103.68 75.34 M46.99 75.34 L58.33 98.01 M58.33 98.01 L92.34 98.01 M92.34 98.01 L103.68 75.34" fill="none" stroke="#ffffff" stroke-width="4.76" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
