@@ -350,12 +350,12 @@ def install_theme():
             if key == "ImageDir":
                 line = f"ImageDir={THEME}"
             elif key == "WatermarkVerticalAlignment":
-                line = "WatermarkVerticalAlignment=.42"
+                line = "WatermarkVerticalAlignment=.96"
             elif key == "VerticalAlignment":
                 line = "VerticalAlignment=.68"
         lines.append(line)
         if stripped == "[Plymouth Theme]":
-            lines += [f"Name={NAME}", "Description=The Bedrock Linux logo over the spinner"]
+            lines += [f"Name={NAME}", "Description=The Bedrock Linux logo below the spinner"]
     write_atomic(THEME / "bedrock.plymouth", "\n".join(lines) + "\n")
     run("plymouth-set-default-theme", "bedrock")
     log(f"boot splash: Plymouth theme {THEME}")
